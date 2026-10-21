@@ -436,12 +436,19 @@ targets:
   - name: b
     chip: chip-b
     probe: 1234:0002
+  - name: c
+    chip: chip-c
+    probe: 1234:0003
+  - name: d
+    chip: chip-d
+    probe: 1234:0004
 ";
 
     /// Like a real board, a cancelled run takes a while to stop, because the core is halted and its state dumped.
     const HALT_TIME: Duration = Duration::from_millis(100);
 
     /// Stands in for a board. The "ELF" is a script: `ok`, `fail` or `sleep:<ms>`. Sleeps can be cancelled.
+    /// A script can end in `#<tag>`, to record when the run used its chip.
     #[derive(Default)]
     struct FakeRunner {
         /// Number of runs currently in progress, per chip.
@@ -451,6 +458,10 @@ targets:
         max_concurrent: AtomicUsize,
         timeouts: Mutex<Vec<Duration>>,
         cancelled: AtomicUsize,
+        /// Tags of runs that have started.
+        started: Mutex<HashSet<String>>,
+        /// `(tag, chip, start, end)` of tagged runs that have ended.
+        uses: Mutex<Vec<(String, String, Instant, Instant)>>,
     }
 
     impl FakeRunner {
@@ -501,7 +512,19 @@ targets:
                 self.max_concurrent.fetch_max(total, Ordering::SeqCst);
             }
 
-            let res = self.script(elf, &cancel);
+            let start = Instant::now();
+            let (script, tag) = match elf.iter().position(|&c| c == b'#') {
+                Some(i) => (&elf[..i], Some(&elf[i + 1..])),
+                None => (elf, None),
+            };
+            if let Some(tag) = tag {
+                self.started.lock().insert(String::from_utf8_lossy(tag).into_owned());
+            }
+            let res = self.script(script, &cancel);
+            if let Some(tag) = tag {
+                let tag = String::from_utf8_lossy(tag).into_owned();
+                self.uses.lock().push((tag, probe.chip.clone(), start, Instant::now()));
+            }
 
             *self.running.lock().get_mut(&probe.chip).unwrap() -= 1;
             res
@@ -803,5 +826,115 @@ targets:
         assert_eq!(status, StatusCode::OK);
         assert!(res.ok);
         assert_eq!(fake.cancelled.load(Ordering::SeqCst), 0);
+    }
+
+    /// xorshift, so the stress test is random but repeatable.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    /// Many clients at once, sending random single jobs and groups, with failures and disconnects.
+    /// Every job must finish, and jobs that share a target must never hold it at the same time.
+    #[tokio::test]
+    async fn stress() {
+        // No reservations at all, reservations soon after queueing, and immediate ones (strict FIFO).
+        for (seed, reserve_after) in [
+            (1, Duration::from_secs(30)),
+            (2, Duration::from_millis(20)),
+            (3, Duration::ZERO),
+        ] {
+            let (fake, cx) = setup();
+            cx.lock().queue = Queue::new(reserve_after);
+            let mut rng = Rng(seed);
+
+            let mut clients = Vec::new();
+            for job in 0..60 {
+                let size = 1 + rng.below(3) as usize;
+                let mut targets = Vec::new();
+                while targets.len() < size {
+                    let t = ["a", "b", "c", "d"][rng.below(4) as usize];
+                    if !targets.contains(&t) {
+                        targets.push(t);
+                    }
+                }
+                let members: Vec<(String, String)> = targets
+                    .iter()
+                    .map(|t| {
+                        let script = match rng.below(10) {
+                            0 => "fail".to_string(),
+                            _ => format!("sleep:{}", 5 + rng.below(25)),
+                        };
+                        (t.to_string(), format!("{}#{}", script, job))
+                    })
+                    .collect();
+                let fails = members.iter().any(|(_, s)| s.starts_with("fail"));
+                // Some clients disconnect, either while queued or while running.
+                let disconnect = match rng.below(10) {
+                    0 => Some((false, Duration::from_millis(rng.below(50)))),
+                    1 => Some((true, Duration::from_millis(rng.below(20)))),
+                    _ => None,
+                };
+
+                let (cx, fake) = (cx.clone(), fake.clone());
+                clients.push(tokio::spawn(async move {
+                    let members: Vec<(&str, &str)> = members.iter().map(|(t, s)| (t.as_str(), s.as_str())).collect();
+                    match disconnect {
+                        Some((when_running, after)) => {
+                            let stream = start_run(&cx, &members).await;
+                            if when_running {
+                                wait_until(|| fake.started.lock().contains(&job.to_string())).await;
+                            }
+                            tokio::time::sleep(after).await;
+                            drop(stream);
+                        }
+                        None => {
+                            let (status, res) = run_group(&cx, &members).await;
+                            assert_eq!(res.ok, !fails, "job {}: {:?}", job, res);
+                            assert_eq!(status == StatusCode::OK, !fails, "job {}: {}", job, status);
+                        }
+                    }
+                }));
+            }
+
+            let results = tokio::time::timeout(Duration::from_secs(30), join_all(clients))
+                .await
+                .unwrap_or_else(|_| panic!("seed {}: jobs didn't finish", seed));
+            for r in results {
+                r.unwrap();
+            }
+
+            // Disconnected jobs may still be stopping. After that, every target must be free.
+            wait_until(|| fake.running.lock().values().all(|&n| n == 0)).await;
+            let all = [("a", "ok"), ("b", "ok"), ("c", "ok"), ("d", "ok")];
+            let (status, _) = tokio::time::timeout(Duration::from_secs(2), run_group(&cx, &all))
+                .await
+                .unwrap_or_else(|_| panic!("seed {}: a target is still held", seed));
+            assert_eq!(status, StatusCode::OK);
+
+            // A job holds all its targets from before its first run starts until after its last run ends.
+            let mut jobs: HashMap<String, (Instant, Instant, HashSet<String>)> = HashMap::new();
+            for (tag, chip, start, end) in fake.uses.lock().iter() {
+                let job = jobs.entry(tag.clone()).or_insert((*start, *end, HashSet::new()));
+                job.0 = job.0.min(*start);
+                job.1 = job.1.max(*end);
+                job.2.insert(chip.clone());
+            }
+            assert!(jobs.len() > 40, "seed {}: only {} jobs ran", seed, jobs.len());
+            for (t1, (s1, e1, c1)) in &jobs {
+                for (t2, (s2, e2, c2)) in &jobs {
+                    if t1 < t2 && !c1.is_disjoint(c2) {
+                        assert!(!(s1 < e2 && s2 < e1), "seed {}: jobs {} and {} overlap", seed, t1, t2);
+                    }
+                }
+            }
+            assert_eq!(fake.overlaps.load(Ordering::SeqCst), 0);
+        }
     }
 }
