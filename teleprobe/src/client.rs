@@ -8,7 +8,7 @@ use blake3::Hasher;
 use futures::{StreamExt, stream};
 use log::{error, info, warn};
 use object::{Object, ObjectSection};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
@@ -190,46 +190,71 @@ async fn run_job(
 }
 
 async fn run_job_inner(client: &Client, creds: &Credentials, job: &Job, show_output: bool) -> Result<(), ()> {
-    let res = client
-        .post(format!("{}/targets/{}/run", creds.host, job.target))
-        .query(&RunArgs { timeout: job.timeout })
-        .body(job.elf.clone())
-        .bearer_auth(&creds.token)
-        .send()
-        .await;
-
-    let mut logs = String::new();
-    let result = match res.context("HTTP request failed") {
-        Ok(res) => {
-            let status = res.status();
-            logs = res.text().await.unwrap_or_else(|_| "empty".to_string());
-            if status.is_success() {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!(
-                    "HTTP request failed with status code: {}: {}",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("unknown")
-                ))
-            }
-        }
-        Err(e) => Err(e),
+    let req = api::RunRequest {
+        members: vec![api::RunMember {
+            target: job.target.clone(),
+            elf: job.elf.clone(),
+        }],
     };
 
-    match result {
-        Ok(()) => {
-            info!("=== {} {}: OK", job.target, job.path.display());
-            if show_output {
-                info!("{}", logs);
-            }
-            Ok(())
-        }
+    let res = match send_run(client, creds, &req, job.timeout).await {
+        Ok(res) => res,
         Err(e) => {
-            error!("=== {} {}: FAILED: {}", job.target, job.path.display(), e);
-            error!("{}", logs);
-            Err(())
+            error!("=== {} {}: FAILED: {:#}", job.target, job.path.display(), e);
+            return Err(());
+        }
+    };
+
+    for m in &res.members {
+        if m.ok {
+            info!("=== {} {}: OK", m.target, job.path.display());
+            if show_output {
+                info!("{}", m.logs);
+            }
+        } else {
+            let reason = m.reason.as_deref().unwrap_or("unknown");
+            error!("=== {} {}: FAILED: {}", m.target, job.path.display(), reason);
+            error!("{}", m.logs);
         }
     }
+
+    if res.ok { Ok(()) } else { Err(()) }
+}
+
+/// Sends a run request. Returns an error if the run didn't happen, for example because the request was invalid.
+async fn send_run(
+    client: &Client,
+    creds: &Credentials,
+    req: &api::RunRequest,
+    timeout: Option<u64>,
+) -> anyhow::Result<api::RunResponse> {
+    let res = client
+        .post(format!("{}/targets/run", creds.host))
+        .query(&RunArgs { timeout })
+        .json(req)
+        .bearer_auth(&creds.token)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    // Runs answer 200 or 400 with a JSON body. Anything else, or a body that isn't JSON, is a request error.
+    let status = res.status();
+    let body = res.text().await.unwrap_or_else(|_| "empty".to_string());
+    if status == StatusCode::OK || status == StatusCode::BAD_REQUEST {
+        if let Ok(res) = serde_json::from_str::<api::RunResponse>(&body) {
+            if res.ok && status != StatusCode::OK {
+                bail!("server returned status {} for a passing run", status.as_u16());
+            }
+            return Ok(res);
+        }
+    }
+
+    bail!(
+        "HTTP request failed with status code: {}: {}: {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("unknown"),
+        body
+    )
 }
 
 fn load_cache(cache: Option<String>) -> Cache {
